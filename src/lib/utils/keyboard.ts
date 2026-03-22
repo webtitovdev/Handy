@@ -169,13 +169,30 @@ const capitalizeKey = (key: string): string => {
 };
 
 /**
+ * Mouse button display names mapping.
+ * Maps backend key names to user-friendly display strings.
+ */
+const mouseButtonNames: Record<string, string> = {
+  mouse4: "Mouse 4",
+  mouse5: "Mouse 5",
+  mousex1: "Mouse 4",
+  mousex2: "Mouse 5",
+  mousemiddle: "Middle Click",
+  middleclick: "Middle Click",
+};
+
+/**
  * Format a single key part for display.
- * Handles _left/_right suffixes and capitalizes names.
- * e.g. "shift_left" -> "Left Shift", "option" -> "Option", "space" -> "Space"
+ * Handles _left/_right suffixes, mouse buttons, and capitalizes names.
+ * e.g. "shift_left" -> "Left Shift", "mouse4" -> "Mouse 4", "space" -> "Space"
  */
 const formatKeyPart = (part: string): string => {
   const trimmed = part.trim();
   if (!trimmed) return "";
+
+  // Check mouse button names first
+  const mouseName = mouseButtonNames[trimmed.toLowerCase()];
+  if (mouseName) return mouseName;
 
   if (trimmed.endsWith("_left")) {
     const name = trimmed.slice(0, -5);

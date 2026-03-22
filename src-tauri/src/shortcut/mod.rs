@@ -11,6 +11,8 @@
 
 mod handler;
 pub mod handy_keys;
+#[cfg(target_os = "windows")]
+pub mod mouse_hook;
 mod tauri_impl;
 
 use log::{error, info, warn};
@@ -334,6 +336,11 @@ fn validate_shortcut_for_implementation(
     raw: &str,
     implementation: KeyboardImplementation,
 ) -> Result<(), String> {
+    // Tauri implementation does not support mouse buttons
+    if implementation == KeyboardImplementation::Tauri && raw.to_lowercase().contains("mouse") {
+        return Err("Mouse button shortcuts are not supported with the Tauri implementation. Switch to HandyKeys to use mouse buttons.".into());
+    }
+
     match implementation {
         KeyboardImplementation::Tauri => tauri_impl::validate_shortcut(raw),
         KeyboardImplementation::HandyKeys => handy_keys::validate_shortcut(raw),

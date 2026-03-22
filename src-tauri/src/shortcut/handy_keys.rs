@@ -41,6 +41,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::settings::{self, get_settings, ShortcutBinding};
 
 use super::handler::handle_shortcut_event;
+#[cfg(target_os = "windows")]
+use super::mouse_hook;
 
 /// Commands that can be sent to the hotkey manager thread
 enum ManagerCommand {
@@ -70,6 +72,9 @@ pub struct HandyKeysState {
     recording_binding_id: Mutex<Option<String>>,
     /// Flag to stop recording loop
     recording_running: Arc<AtomicBool>,
+    /// Mouse hook for capturing mouse button shortcuts (Windows only)
+    #[cfg(target_os = "windows")]
+    mouse_hook_state: Option<mouse_hook::MouseHookState>,
 }
 
 /// Key event sent to frontend during recording mode
@@ -96,6 +101,19 @@ impl HandyKeysState {
             Self::manager_thread(cmd_rx, app_clone);
         });
 
+        // Start mouse hook on Windows
+        #[cfg(target_os = "windows")]
+        let mouse_hook_state = match mouse_hook::MouseHookState::new() {
+            Ok(state) => {
+                info!("Mouse hook initialized successfully");
+                Some(state)
+            }
+            Err(e) => {
+                error!("Failed to initialize mouse hook: {}", e);
+                None
+            }
+        };
+
         Ok(Self {
             command_sender: Mutex::new(cmd_tx),
             thread_handle: Mutex::new(Some(thread_handle)),
@@ -103,6 +121,8 @@ impl HandyKeysState {
             is_recording: AtomicBool::new(false),
             recording_binding_id: Mutex::new(None),
             recording_running: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "windows")]
+            mouse_hook_state,
         })
     }
 
@@ -124,7 +144,7 @@ impl HandyKeysState {
         let mut hotkey_to_binding: HashMap<HotkeyId, (String, String)> = HashMap::new(); // (binding_id, hotkey_string)
 
         loop {
-            // Check for hotkey events (non-blocking)
+            // Check for keyboard hotkey events (non-blocking)
             while let Some(event) = manager.try_recv() {
                 if let Some((binding_id, hotkey_string)) = hotkey_to_binding.get(&event.id) {
                     debug!(
@@ -136,6 +156,34 @@ impl HandyKeysState {
                 }
             }
 
+            // Check for mouse hook events (Windows only).
+            // Skip during recording — the recording_loop handles events then.
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(mouse_state) = app.try_state::<HandyKeysState>() {
+                    if !mouse_state.is_recording.load(Ordering::SeqCst) {
+                        if let Some(ref mh) = mouse_state.mouse_hook_state {
+                            while let Some(mouse_event) = mh.try_recv() {
+                                if let Some((binding_id, hotkey_string)) =
+                                    mh.match_event(&mouse_event)
+                                {
+                                    debug!(
+                                        "mouse hook event: binding={}, hotkey={}, pressed={}",
+                                        binding_id, hotkey_string, mouse_event.is_down
+                                    );
+                                    handle_shortcut_event(
+                                        &app,
+                                        &binding_id,
+                                        &hotkey_string,
+                                        mouse_event.is_down,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Check for commands (non-blocking with timeout)
             match cmd_rx.recv_timeout(std::time::Duration::from_millis(10)) {
                 Ok(cmd) => match cmd {
@@ -144,6 +192,18 @@ impl HandyKeysState {
                         hotkey_string,
                         response,
                     } => {
+                        // Route mouse bindings to mouse hook
+                        #[cfg(target_os = "windows")]
+                        if mouse_hook::is_mouse_binding(&hotkey_string) {
+                            let result = Self::do_register_mouse(
+                                &app,
+                                &binding_id,
+                                &hotkey_string,
+                            );
+                            let _ = response.send(result);
+                            continue;
+                        }
+
                         let result = Self::do_register(
                             &manager,
                             &mut binding_to_hotkey,
@@ -157,6 +217,16 @@ impl HandyKeysState {
                         binding_id,
                         response,
                     } => {
+                        // Try to unregister from mouse hook first
+                        #[cfg(target_os = "windows")]
+                        {
+                            if let Some(mouse_state) = app.try_state::<HandyKeysState>() {
+                                if let Some(ref mh) = mouse_state.mouse_hook_state {
+                                    let _ = mh.unregister(&binding_id);
+                                }
+                            }
+                        }
+
                         let result = Self::do_unregister(
                             &manager,
                             &mut binding_to_hotkey,
@@ -181,6 +251,27 @@ impl HandyKeysState {
         }
 
         info!("handy-keys manager thread stopped");
+    }
+
+    /// Register a mouse button binding via the mouse hook (Windows only).
+    #[cfg(target_os = "windows")]
+    fn do_register_mouse(
+        app: &AppHandle,
+        binding_id: &str,
+        hotkey_string: &str,
+    ) -> Result<(), String> {
+        let (button, mods) = mouse_hook::parse_mouse_binding(hotkey_string)?;
+        if let Some(state) = app.try_state::<HandyKeysState>() {
+            if let Some(ref mh) = state.mouse_hook_state {
+                mh.register(binding_id, button, mods, hotkey_string)?;
+                debug!(
+                    "Registered mouse shortcut: {} -> {}",
+                    binding_id, hotkey_string
+                );
+                return Ok(());
+            }
+        }
+        Err("Mouse hook not available".into())
     }
 
     /// Register a hotkey
@@ -287,6 +378,12 @@ impl HandyKeysState {
         self.is_recording.store(true, Ordering::SeqCst);
         self.recording_running.store(true, Ordering::SeqCst);
 
+        // Put mouse hook into recording mode (Windows only)
+        #[cfg(target_os = "windows")]
+        if let Some(ref mh) = self.mouse_hook_state {
+            mh.start_recording();
+        }
+
         // Start a thread to emit key events to the frontend
         let app_clone = app.clone();
         let recording_running = Arc::clone(&self.recording_running);
@@ -301,7 +398,10 @@ impl HandyKeysState {
     /// Recording loop - emits key events to frontend during recording
     fn recording_loop(app: AppHandle, running: Arc<AtomicBool>) {
         while running.load(Ordering::SeqCst) {
-            let event = {
+            let mut had_event = false;
+
+            // Poll keyboard events from KeyboardListener
+            let kb_event = {
                 let state = match app.try_state::<HandyKeysState>() {
                     Some(s) => s,
                     None => break,
@@ -310,8 +410,7 @@ impl HandyKeysState {
                 listener.as_ref().and_then(|l| l.as_ref()?.try_recv())
             };
 
-            if let Some(key_event) = event {
-                // Convert to frontend-friendly format
+            if let Some(key_event) = kb_event {
                 let frontend_event = FrontendKeyEvent {
                     modifiers: modifiers_to_strings(key_event.modifiers),
                     key: key_event.key.map(|k| k.to_string().to_lowercase()),
@@ -322,11 +421,38 @@ impl HandyKeysState {
                         .unwrap_or_default(),
                 };
 
-                // Emit to frontend
                 if let Err(e) = app.emit("handy-keys-event", &frontend_event) {
                     error!("Failed to emit key event: {}", e);
                 }
-            } else {
+                had_event = true;
+            }
+
+            // Poll mouse events from mouse hook (Windows only)
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(state) = app.try_state::<HandyKeysState>() {
+                    if let Some(ref mh) = state.mouse_hook_state {
+                        if let Some(mouse_event) = mh.try_recv() {
+                            let frontend_event = FrontendKeyEvent {
+                                modifiers: mouse_hook::modifiers_to_strings(mouse_event.mods),
+                                key: Some(mouse_event.button.to_key_name().to_string()),
+                                is_key_down: mouse_event.is_down,
+                                hotkey_string: mouse_hook::format_mouse_hotkey(
+                                    mouse_event.button,
+                                    mouse_event.mods,
+                                ),
+                            };
+
+                            if let Err(e) = app.emit("handy-keys-event", &frontend_event) {
+                                error!("Failed to emit mouse event: {}", e);
+                            }
+                            had_event = true;
+                        }
+                    }
+                }
+            }
+
+            if !had_event {
                 thread::sleep(std::time::Duration::from_millis(10));
             }
         }
@@ -338,6 +464,12 @@ impl HandyKeysState {
     pub fn stop_recording(&self) -> Result<(), String> {
         self.is_recording.store(false, Ordering::SeqCst);
         self.recording_running.store(false, Ordering::SeqCst);
+
+        // Stop mouse hook recording mode (Windows only)
+        #[cfg(target_os = "windows")]
+        if let Some(ref mh) = self.mouse_hook_state {
+            mh.stop_recording();
+        }
 
         {
             let mut recording = self
@@ -364,6 +496,12 @@ impl Drop for HandyKeysState {
         // Signal recording to stop
         self.recording_running.store(false, Ordering::SeqCst);
         self.is_recording.store(false, Ordering::SeqCst);
+
+        // Stop mouse hook (Windows only)
+        #[cfg(target_os = "windows")]
+        if let Some(ref mh) = self.mouse_hook_state {
+            mh.stop();
+        }
 
         // Send shutdown command
         if let Ok(sender) = self.command_sender.lock() {
@@ -409,11 +547,24 @@ fn modifiers_to_strings(modifiers: handy_keys::Modifiers) -> Vec<String> {
 }
 
 /// Validate a shortcut string for the HandyKeys implementation.
-/// HandyKeys is more permissive: allows modifier-only combos and the fn key.
+/// HandyKeys is more permissive: allows modifier-only combos, fn key, and mouse buttons.
 pub fn validate_shortcut(raw: &str) -> Result<(), String> {
     if raw.trim().is_empty() {
         return Err("Shortcut cannot be empty".into());
     }
+
+    // Mouse bindings have their own validation
+    #[cfg(target_os = "windows")]
+    if mouse_hook::is_mouse_binding(raw) {
+        return mouse_hook::validate_mouse_binding(raw);
+    }
+
+    // On non-Windows, reject mouse bindings (not yet supported)
+    #[cfg(not(target_os = "windows"))]
+    if raw.to_lowercase().contains("mouse") {
+        return Err("Mouse button shortcuts are not supported on this platform".into());
+    }
+
     // HandyKeys accepts modifier-only, key-only, and modifier+key combos
     // Just verify the string is parseable
     raw.parse::<Hotkey>()

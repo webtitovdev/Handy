@@ -144,9 +144,21 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
 
     window.addEventListener("keydown", handleKeyDown);
 
+    // Prevent mouse4/mouse5/middle from triggering browser navigation during recording
+    const preventMouseNavigation = (e: MouseEvent) => {
+      if (e.button === 1 || e.button === 3 || e.button === 4) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+    window.addEventListener("mousedown", preventMouseNavigation, true);
+    window.addEventListener("mouseup", preventMouseNavigation, true);
+
     return () => {
       cleanup = true;
       window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("mousedown", preventMouseNavigation, true);
+      window.removeEventListener("mouseup", preventMouseNavigation, true);
       if (unlistenRef.current) {
         unlistenRef.current();
         unlistenRef.current = null;
