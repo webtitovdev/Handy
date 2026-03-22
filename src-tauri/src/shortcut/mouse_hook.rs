@@ -99,9 +99,8 @@ static HOOK_EVENT_SENDER: OnceLock<Mutex<Option<Sender<MouseHookEvent>>>> = Once
 /// Whether we are currently in recording mode (hook should capture all supported buttons).
 static RECORDING_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Registered bindings packed for fast lookup from the hook callback.
-/// Format: array of (button_id, mods) tuples stored as u16 values.
-/// We use a simple approach: a global vec behind a mutex.
+/// Registered bindings for fast lookup from the hook callback.
+/// Must be global because the hook callback is a C function pointer without user data.
 static REGISTERED_BINDINGS: OnceLock<Mutex<Vec<(MouseButton, u8)>>> = OnceLock::new();
 
 /// Thread ID for the hook thread (used for PostThreadMessage to stop it).
@@ -132,8 +131,11 @@ impl MouseHookState {
             *guard = Some(tx);
         }
 
-        // Initialize registered bindings store
-        REGISTERED_BINDINGS.get_or_init(|| Mutex::new(Vec::new()));
+        // Initialize or clear registered bindings (in case of re-creation after stop)
+        let bindings_lock = REGISTERED_BINDINGS.get_or_init(|| Mutex::new(Vec::new()));
+        if let Ok(mut guard) = bindings_lock.lock() {
+            guard.clear();
+        }
 
         // Start hook thread
         let handle = thread::spawn(|| {
@@ -334,12 +336,14 @@ fn get_current_modifiers() -> u8 {
     mods
 }
 
+const XBUTTON1: u32 = 0x0001;
+const XBUTTON2: u32 = 0x0002;
+
 /// Extract XBUTTON number from mouseData field (HIWORD).
 fn xbutton_from_mousedata(mouse_data: u32) -> Option<MouseButton> {
-    let hiword = mouse_data >> 16;
-    match hiword {
-        1 => Some(MouseButton::X1), // XBUTTON1
-        2 => Some(MouseButton::X2), // XBUTTON2
+    match mouse_data >> 16 {
+        XBUTTON1 => Some(MouseButton::X1),
+        XBUTTON2 => Some(MouseButton::X2),
         _ => None,
     }
 }
@@ -354,31 +358,34 @@ fn is_registered(button: MouseButton, mods: u8) -> bool {
     false
 }
 
-/// Send event through the global channel. Returns true if the event was sent
-/// (meaning it should be blocked from other apps).
+/// Send event through the global channel. Returns true only if the event
+/// was actually delivered — the hook should block the OS event only then.
 fn send_hook_event(button: MouseButton, mods: u8, is_down: bool) -> bool {
     let is_recording = RECORDING_ACTIVE.load(Ordering::SeqCst);
     let is_matched = is_registered(button, mods);
 
-    // Only send if recording or matched a binding
     if !is_recording && !is_matched {
         return false;
     }
 
-    if let Some(sender_lock) = HOOK_EVENT_SENDER.get() {
-        if let Ok(guard) = sender_lock.lock() {
-            if let Some(tx) = guard.as_ref() {
-                let event = MouseHookEvent {
+    // Only block the OS event if we successfully deliver it to the app.
+    // Otherwise let it pass through so the button isn't silently swallowed.
+    let delivered = HOOK_EVENT_SENDER
+        .get()
+        .and_then(|lock| lock.lock().ok())
+        .and_then(|guard| {
+            guard.as_ref().map(|tx| {
+                tx.send(MouseHookEvent {
                     button,
                     mods,
                     is_down,
-                };
-                let _ = tx.send(event);
-            }
-        }
-    }
+                })
+                .is_ok()
+            })
+        })
+        .unwrap_or(false);
 
-    true // Block this event from reaching other apps
+    delivered
 }
 
 /// The low-level mouse hook procedure.
@@ -458,25 +465,6 @@ pub fn parse_mouse_binding(hotkey_str: &str) -> Result<(MouseButton, u8), String
     }
 }
 
-/// Format a mouse binding back to a canonical hotkey string (e.g. "ctrl+mouse4").
-pub fn format_mouse_hotkey(button: MouseButton, mods: u8) -> String {
-    let mut parts = Vec::new();
-    if mods & modifiers::CTRL != 0 {
-        parts.push("ctrl");
-    }
-    if mods & modifiers::SHIFT != 0 {
-        parts.push("shift");
-    }
-    if mods & modifiers::ALT != 0 {
-        #[cfg(target_os = "macos")]
-        parts.push("option");
-        #[cfg(not(target_os = "macos"))]
-        parts.push("alt");
-    }
-    parts.push(button.to_key_name());
-    parts.join("+")
-}
-
 /// Build modifier name list for FrontendKeyEvent (matches handy-keys naming).
 pub fn modifiers_to_strings(mods: u8) -> Vec<String> {
     let mut result = Vec::new();
@@ -487,12 +475,16 @@ pub fn modifiers_to_strings(mods: u8) -> Vec<String> {
         result.push("shift".to_string());
     }
     if mods & modifiers::ALT != 0 {
-        #[cfg(target_os = "macos")]
-        result.push("option".to_string());
-        #[cfg(not(target_os = "macos"))]
         result.push("alt".to_string());
     }
     result
+}
+
+/// Format a mouse binding back to a canonical hotkey string (e.g. "ctrl+mouse4").
+pub fn format_mouse_hotkey(button: MouseButton, mods: u8) -> String {
+    let mut parts = modifiers_to_strings(mods);
+    parts.push(button.to_key_name().to_string());
+    parts.join("+")
 }
 
 /// Validate a mouse binding string.

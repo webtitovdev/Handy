@@ -170,15 +170,12 @@ const capitalizeKey = (key: string): string => {
 
 /**
  * Mouse button display names mapping.
- * Maps backend key names to user-friendly display strings.
+ * Keys match the canonical names emitted by MouseButton::to_key_name() in the backend.
  */
 const mouseButtonNames: Record<string, string> = {
   mouse4: "Mouse 4",
   mouse5: "Mouse 5",
-  mousex1: "Mouse 4",
-  mousex2: "Mouse 5",
   mousemiddle: "Middle Click",
-  middleclick: "Middle Click",
 };
 
 /**
