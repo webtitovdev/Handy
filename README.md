@@ -1,4 +1,17 @@
-# Handy
+# Handy (Fork with Mouse Button Support)
+
+> **This is a fork of [cjpais/Handy](https://github.com/cjpais/Handy)** with added mouse button support for shortcut bindings on Windows.
+
+## What's New in This Fork
+
+**Mouse button shortcuts (Windows)** — You can now bind Mouse 4 (back), Mouse 5 (forward), and Middle Click as shortcut triggers for transcription, post-processing, and cancel actions. Works with modifier combinations (e.g. `Ctrl+Mouse4`).
+
+- Captured via a low-level Windows mouse hook (`WH_MOUSE_LL`)
+- Matched events are blocked from reaching other apps (no accidental browser navigation)
+- Full recording mode support — click to record, press a mouse button, binding saved
+- Requires the HandyKeys keyboard implementation (default on Windows)
+
+---
 
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?style=for-the-badge&logo=discord&logoColor=white)](https://discord.com/invite/WVBeWsNXK4)
 
