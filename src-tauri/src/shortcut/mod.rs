@@ -11,6 +11,7 @@
 
 mod handler;
 pub mod handy_keys;
+pub mod mouse_bindings;
 #[cfg(target_os = "windows")]
 pub mod mouse_hook;
 mod tauri_impl;
@@ -161,17 +162,22 @@ pub fn change_binding(
         }
     }
 
-    // Unregister the existing binding
-    if let Err(e) = unregister_shortcut(&app, binding_to_modify.clone()) {
-        let error_msg = format!("Failed to unregister shortcut: {}", e);
-        error!("change_binding error: {}", error_msg);
-    }
-
-    // Validate the new shortcut for the current keyboard implementation
+    // Validate the new shortcut *before* touching the live registration, so a
+    // rejected binding leaves the previous shortcut working instead of
+    // silently unbinding it.
     if let Err(e) = validate_shortcut_for_implementation(&binding, settings.keyboard_implementation)
     {
         warn!("change_binding validation error: {}", e);
         return Err(e);
+    }
+
+    // Remember what is live right now so a failed registration can roll back.
+    let previous_binding = binding_to_modify.current_binding.clone();
+
+    // Unregister the existing binding
+    if let Err(e) = unregister_shortcut(&app, binding_to_modify.clone()) {
+        let error_msg = format!("Failed to unregister shortcut: {}", e);
+        error!("change_binding error: {}", error_msg);
     }
 
     // Create an updated binding
@@ -182,6 +188,17 @@ pub fn change_binding(
     if let Err(e) = register_shortcut(&app, updated_binding.clone()) {
         let error_msg = format!("Failed to register shortcut: {}", e);
         error!("change_binding error: {}", error_msg);
+
+        // Restore the previous shortcut so the user is never left without one.
+        let mut rollback = updated_binding.clone();
+        rollback.current_binding = previous_binding;
+        if let Err(restore_err) = register_shortcut(&app, rollback) {
+            error!(
+                "change_binding failed to restore previous shortcut: {}",
+                restore_err
+            );
+        }
+
         return Ok(BindingResponse {
             success: false,
             binding: None,
@@ -336,9 +353,18 @@ fn validate_shortcut_for_implementation(
     raw: &str,
     implementation: KeyboardImplementation,
 ) -> Result<(), String> {
-    // Tauri implementation does not support mouse buttons
-    if implementation == KeyboardImplementation::Tauri && raw.to_lowercase().contains("mouse") {
-        return Err("Mouse button shortcuts are not supported with the Tauri implementation. Switch to HandyKeys to use mouse buttons.".into());
+    // Mouse buttons need a platform capture backend, which only the
+    // HandyKeys implementation wires up.
+    if mouse_bindings::is_mouse_binding(raw) {
+        if implementation == KeyboardImplementation::Tauri {
+            return Err(
+                "Mouse button shortcuts are not supported with the Tauri implementation. Switch to HandyKeys to use mouse buttons."
+                    .into(),
+            );
+        }
+        if !mouse_bindings::MOUSE_CAPTURE_SUPPORTED {
+            return Err(mouse_bindings::MOUSE_UNSUPPORTED_MESSAGE.into());
+        }
     }
 
     match implementation {

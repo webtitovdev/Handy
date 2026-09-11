@@ -6,10 +6,14 @@
 
 **Mouse button shortcuts (Windows)** — You can now bind Mouse 4 (back), Mouse 5 (forward), and Middle Click as shortcut triggers for transcription, post-processing, and cancel actions. Works with modifier combinations (e.g. `Ctrl+Mouse4`).
 
-- Captured via a low-level Windows mouse hook (`WH_MOUSE_LL`)
+- Captured via a low-level Windows mouse hook (`WH_MOUSE_LL`), started lazily only while a mouse binding exists
+- Bindings persist across restarts — they are registered from saved settings at startup (fixed a race where registration happened before the hook was reachable, forcing users to re-record the button after every launch)
 - Matched events are blocked from reaching other apps (no accidental browser navigation)
+- Stray button releases are dropped, so a button held while the app starts can't fire a stop without a start
+- Conflicting combos (same button + modifiers on two shortcuts) are rejected with a clear error, and a failed change rolls back to the previous shortcut
 - Full recording mode support — click to record, press a mouse button, binding saved
 - Requires the HandyKeys keyboard implementation (default on Windows)
+- Platform-independent core (`mouse_bindings.rs`) with a documented porting path for macOS (CGEventTap) and Linux — see [`docs/mouse-bindings.md`](docs/mouse-bindings.md)
 
 ---
 

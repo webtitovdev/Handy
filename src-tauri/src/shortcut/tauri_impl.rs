@@ -46,6 +46,15 @@ pub fn validate_shortcut(raw: &str) -> Result<(), String> {
         return Err("Shortcut cannot be empty".into());
     }
 
+    // Mouse buttons need a platform capture backend; Tauri's plugin is
+    // keyboard-only.
+    if super::mouse_bindings::is_mouse_binding(raw) {
+        return Err(
+            "Mouse button shortcuts are not supported with the Tauri implementation. Switch to HandyKeys to use mouse buttons."
+                .into(),
+        );
+    }
+
     let modifiers = [
         "ctrl", "control", "shift", "alt", "option", "meta", "command", "cmd", "super", "win",
         "windows",
